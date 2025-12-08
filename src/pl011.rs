@@ -2,16 +2,21 @@
 
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
+use alloc::sync::{Arc, Weak};
 use spin::Mutex;
+use alloc::string::String;
 
 use crate::regs::*;
 
 /// Callback type for interrupt injection
 pub type IrqCallback = Box<dyn Fn() + Send + Sync>;
+/// Callback type for output probe
+pub type OutputProbe = Box<dyn Fn(u8) + Send + Sync>;
 
 /// Configuration for Virtual PL011 device
 #[derive(Debug, Clone)]
 pub struct VirtPL011Config {
+    pub uart_id: usize,
     pub base_gpa: usize,
     pub length: usize,
     pub irq_id: usize,
@@ -20,6 +25,7 @@ pub struct VirtPL011Config {
 impl Default for VirtPL011Config {
     fn default() -> Self {
         Self {
+            uart_id: 0,
             base_gpa: 0x0900_0000,
             length: 0x1000,
             irq_id: 33,
@@ -110,20 +116,67 @@ pub struct VirtPL011 {
     config: VirtPL011Config,
     state: Mutex<PL011State>,
     irq_callback: Mutex<Option<IrqCallback>>,
+    output_probe: Mutex<Option<OutputProbe>>,
+    /// Peer vUART for inter-VM communication
+    peer: Mutex<Option<Weak<VirtPL011>>>,
 }
 
 impl VirtPL011 {
     pub fn new(config: VirtPL011Config) -> Self {
         info!(
-            "VirtPL011: created at GPA {:#x}, IRQ {}",
-            config.base_gpa, config.irq_id
+            "VirtPL011[{}]: created at GPA {:#x}, IRQ {}",
+            config.uart_id, config.base_gpa, config.irq_id
         );
-
+        // Use Mutex for interior mutability in Fn closure
+        let line_buffer = Mutex::new(String::new());
+        let output_probe: OutputProbe = Box::new(move |byte: u8| {
+            let mut buffer = line_buffer.lock();
+            match byte {
+                b'\n' => {
+                    info!("VirtPL011[{}]-OutputProbe {}", config.uart_id, *buffer);
+                    buffer.clear();
+                }
+                b'\r' => {
+                    // Ignore carriage return
+                }
+                _ if byte.is_ascii() && !byte.is_ascii_control() => {
+                    buffer.push(byte as char);
+                    if buffer.len() >= 256 {
+                        info!("[Guest] {}", *buffer);
+                        buffer.clear();
+                    }
+                }
+                _ => { }
+            }
+        });
         Self {
             config,
             state: Mutex::new(PL011State::default()),
             irq_callback: Mutex::new(None),
+            output_probe: Mutex::new(Some(output_probe)),
+            peer: Mutex::new(None),
         }
+    }
+
+    /// Connect this vUART to a peer for inter-VM communication.
+    pub fn set_peer(&self, peer: Weak<VirtPL011>) {
+        *self.peer.lock() = Some(peer);
+        info!("VirtPL011[{}]: peer connected for inter-VM communication", self.config.uart_id);
+    }
+
+    /// Get the peer vUART if connected
+    fn get_peer(&self) -> Option<Arc<VirtPL011>> {
+        self.peer.lock().as_ref().and_then(|w| w.upgrade())
+    }
+
+    /// Check if this vUART is connected to a peer
+    pub fn has_peer(&self) -> bool {
+        self.get_peer().is_some()
+    }
+
+    /// Set ouptput probe callback
+    pub fn set_output_probe(&self, _probe: OutputProbe) {
+        *self.output_probe.lock() = Some(_probe);
     }
 
     pub fn base_gpa(&self) -> usize {
@@ -152,7 +205,7 @@ impl VirtPL011 {
 
         let depth = state.fifo_depth();
         if state.read_fifo.len() >= depth {
-            trace!("VirtPL011: RX FIFO full, dropping {:#x}", data);
+            trace!("VirtPL011[{}]: RX FIFO full, dropping {:#x}", self.config.uart_id, data);
             return false;
         }
 
@@ -188,21 +241,42 @@ impl VirtPL011 {
     }
 
     /// Handle TX write
-    fn write_tx_data(&self, data: u8) {
-        let mut state = self.state.lock();
+    fn write_tx_data(&self, data: u8) -> bool {
+        let state = self.state.lock();
 
         if !state.cr.contains(ControlRegister::UARTEN) {
-            warn!("VirtPL011: Write to disabled UART");
+            warn!("VirtPL011[{}]: Write to disabled UART", self.config.uart_id);
         }
         if !state.cr.contains(ControlRegister::TXE) {
-            warn!("VirtPL011: Write with TX disabled");
+            warn!("VirtPL011[{}]: Write with TX disabled", self.config.uart_id);
         }
 
         let loopback = state.cr.contains(ControlRegister::LBE);
+        drop(state);
 
+        // Try to send to peer vUART if connected
+        if let Some(peer) = self.get_peer() {
+            // Push data to peer's RX FIFO
+            let sent = peer.rx_push(data);
+            if !sent {
+                // Peer's RX FIFO is full
+                trace!("VirtPL011[{}]: peer RX full, data dropped: {:#x}", self.config.uart_id, data);
+            }
+
+            if let Some(probe) = &*self.output_probe.lock() {
+                probe(data);
+            }
+            // TX operation completed, set TX interrupt
+            self.state.lock().int_level.insert(InterruptBits::TX);
+            self.update_interrupt();
+
+            return sent;
+        }
+
+        // No peer connected
         // TX always succeeds immediately, set TX interrupt
+        let mut state = self.state.lock();
         state.int_level.insert(InterruptBits::TX);
-
         drop(state);
 
         // Loopback: push to local RX
@@ -212,6 +286,7 @@ impl VirtPL011 {
 
         // Update interrupt state
         self.update_interrupt();
+        true
     }
 
     /// Handle RX read
@@ -252,7 +327,27 @@ impl VirtPL011 {
                 return self.read_rx_data();
             }
             UART_RSR_ECR => state.rsr,
-            UART_FR => state.flags.bits(),
+            UART_FR => {
+                // Get local flags
+                let mut flags = state.flags;
+
+                // If connected to peer, TX status reflects peer's RX status
+                // - this TXFF = peer's RXFF (peer's buffer is full)
+                // - this TXFE = peer's RXFE (peer's buffer is empty)
+                drop(state);
+                if let Some(peer) = self.get_peer() {
+                    let peer_state = peer.state.lock();
+                    // Clear local TX flags and use peer's RX flags
+                    flags.remove(FlagRegister::TXFF | FlagRegister::TXFE);
+                    if peer_state.flags.contains(FlagRegister::RXFF) {
+                        flags.insert(FlagRegister::TXFF);
+                    }
+                    if peer_state.flags.contains(FlagRegister::RXFE) {
+                        flags.insert(FlagRegister::TXFE);
+                    }
+                }
+                return flags.bits();
+            }
             UART_ILPR => state.ilpr,
             UART_IBRD => state.ibrd,
             UART_FBRD => state.fbrd,
@@ -275,7 +370,7 @@ impl VirtPL011 {
             UART_PCELL_ID3 => PL011_PCELL_ID[3] as u32,
 
             _ => {
-                warn!("VirtPL011: Read from unknown register {:#x}", offset);
+                warn!("VirtPL011[{}]: Read from unknown register {:#x}", self.config.uart_id, offset);
                 0
             }
         };
@@ -338,11 +433,11 @@ impl VirtPL011 {
             UART_DMACR => {
                 self.state.lock().dmacr = value;
                 if value & 0x3 != 0 {
-                    warn!("VirtPL011: DMA not supported");
+                    warn!("VirtPL011[{}]: DMA not supported", self.config.uart_id);
                 }
             }
             _ => {
-                warn!("VirtPL011: Write to unknown register {:#x}", offset);
+                warn!("VirtPL011[{}]: Write to unknown register {:#x}", self.config.uart_id, offset);
             }
         }
     }
@@ -352,6 +447,7 @@ impl core::fmt::Debug for VirtPL011 {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         let state = self.state.lock();
         f.debug_struct("VirtPL011")
+            .field("uart_id", &self.config.uart_id)
             .field("base_gpa", &format_args!("{:#x}", self.config.base_gpa))
             .field("irq_id", &self.config.irq_id)
             .field("flags", &state.flags)

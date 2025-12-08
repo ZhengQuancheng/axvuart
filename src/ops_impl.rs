@@ -64,8 +64,6 @@ impl BaseDeviceOps<GuestPhysAddrRange> for VirtPL011 {
         if reg_offset == crate::regs::UART_DR {
             let tx_byte = val as u8;
             self.write_reg(reg_offset, tx_byte as u32);
-            // Direct output to console
-            output_byte(tx_byte);
         } else {
             // For other registers
             let write_val = match width {
@@ -78,32 +76,5 @@ impl BaseDeviceOps<GuestPhysAddrRange> for VirtPL011 {
         }
 
         Ok(())
-    }
-}
-
-/// Line buffer for console output
-static LINE_BUFFER: spin::Mutex<alloc::string::String> =
-    spin::Mutex::new(alloc::string::String::new());
-
-/// Output a byte to console
-fn output_byte(byte: u8) {
-    let mut buffer = LINE_BUFFER.lock();
-
-    match byte {
-        b'\n' => {
-            info!("[Guest] {}", buffer);
-            buffer.clear();
-        }
-        b'\r' => {
-            // Ignore carriage returns
-        }
-        _ if byte.is_ascii() && !byte.is_ascii_control() => {
-            buffer.push(byte as char);
-            if buffer.len() >= 256 {
-                info!("[Guest] {}", buffer);
-                buffer.clear();
-            }
-        }
-        _ => { }
     }
 }
