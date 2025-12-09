@@ -1,17 +1,18 @@
 //! Virtual PL011 UART device implementation
 
-use alloc::boxed::Box;
-use alloc::collections::VecDeque;
-use alloc::sync::{Arc, Weak};
 use spin::Mutex;
+use alloc::boxed::Box;
 use alloc::string::String;
+use alloc::sync::{Arc, Weak};
+use alloc::collections::VecDeque;
+use alloc::collections::BTreeMap;
 
 use crate::regs::*;
 
 /// Callback type for interrupt injection
 pub type IrqCallback = Box<dyn Fn() + Send + Sync>;
 /// Callback type for output probe
-pub type OutputProbe = Box<dyn Fn(u8) + Send + Sync>;
+pub type ProbeCallback = Box<dyn Fn(u8) + Send + Sync>;
 
 /// Configuration for Virtual PL011 device
 #[derive(Debug, Clone)]
@@ -54,27 +55,27 @@ struct PL011State {
     // DMA Control
     dmacr: u32,
 
-    // RX FIFO
-    read_fifo: VecDeque<u32>,
-    read_trigger: usize,
+    // RxFIFO
+    rx_fifo: VecDeque<u32>,
+    rx_trigger: usize,
 }
 
 impl Default for PL011State {
     fn default() -> Self {
         Self {
-            flags: FlagRegister::TXFE | FlagRegister::RXFE,
-            cr: ControlRegister::RXE | ControlRegister::TXE,
-            lcr: LineControlRegister::empty(),
+            flags: FlagRegister::default(),
+            cr: ControlRegister::default(),
+            lcr: LineControlRegister::default(),
             rsr: 0,
             ibrd: 0,
             fbrd: 0,
             ilpr: 0,
-            int_enabled: InterruptBits::empty(),
-            int_level: InterruptBits::TX,
+            int_enabled: InterruptBits::default(),
+            int_level: InterruptBits::default(),
             ifls: DEFAULT_IFLS,
             dmacr: 0,
-            read_fifo: VecDeque::with_capacity(PL011_FIFO_DEPTH),
-            read_trigger: 1,
+            rx_fifo: VecDeque::with_capacity(PL011_FIFO_DEPTH),
+            rx_trigger: 1,
         }
     }
 }
@@ -89,14 +90,14 @@ impl PL011State {
     }
 
     fn can_receive(&self) -> bool {
-        self.read_fifo.len() < self.fifo_depth()
+        self.rx_fifo.len() < self.fifo_depth()
     }
 
     fn set_read_trigger(&mut self) {
         let level = (self.ifls >> 3) & 0x7;
         let depth = self.fifo_depth();
 
-        self.read_trigger = match level {
+        self.rx_trigger = match level {
             0 => depth / 8,
             1 => depth / 4,
             2 => depth / 2,
@@ -105,8 +106,8 @@ impl PL011State {
             _ => depth, // Reserved values
         };
 
-        if self.read_trigger == 0 {
-            self.read_trigger = 1;
+        if self.rx_trigger == 0 {
+            self.rx_trigger = 1;
         }
     }
 }
@@ -116,7 +117,7 @@ pub struct VirtPL011 {
     config: VirtPL011Config,
     state: Mutex<PL011State>,
     irq_callback: Mutex<Option<IrqCallback>>,
-    output_probe: Mutex<Option<OutputProbe>>,
+    probe_callback: Mutex<Option<ProbeCallback>>,
     /// Peer vUART for inter-VM communication
     peer: Mutex<Option<Weak<VirtPL011>>>,
 }
@@ -129,11 +130,11 @@ impl VirtPL011 {
         );
         // Use Mutex for interior mutability in Fn closure
         let line_buffer = Mutex::new(String::new());
-        let output_probe: OutputProbe = Box::new(move |byte: u8| {
+        let output_probe: ProbeCallback = Box::new(move |byte: u8| {
             let mut buffer = line_buffer.lock();
             match byte {
                 b'\n' => {
-                    info!("VirtPL011[{}]-OutputProbe {}", config.uart_id, *buffer);
+                    info!("VirtPL011[{}]: <OutputProbe> {}", config.uart_id, *buffer);
                     buffer.clear();
                 }
                 b'\r' => {
@@ -142,7 +143,7 @@ impl VirtPL011 {
                 _ if byte.is_ascii() && !byte.is_ascii_control() => {
                     buffer.push(byte as char);
                     if buffer.len() >= 256 {
-                        info!("[Guest] {}", *buffer);
+                        info!("VirtPL011[{}]: <OutputProbe> {}", config.uart_id, *buffer);
                         buffer.clear();
                     }
                 }
@@ -153,7 +154,7 @@ impl VirtPL011 {
             config,
             state: Mutex::new(PL011State::default()),
             irq_callback: Mutex::new(None),
-            output_probe: Mutex::new(Some(output_probe)),
+            probe_callback: Mutex::new(Some(output_probe)),
             peer: Mutex::new(None),
         }
     }
@@ -175,8 +176,8 @@ impl VirtPL011 {
     }
 
     /// Set ouptput probe callback
-    pub fn set_output_probe(&self, _probe: OutputProbe) {
-        *self.output_probe.lock() = Some(_probe);
+    pub fn set_probe_callback(&self, _probe: ProbeCallback) {
+        *self.probe_callback.lock() = Some(_probe);
     }
 
     pub fn base_gpa(&self) -> usize {
@@ -191,42 +192,49 @@ impl VirtPL011 {
         self.config.irq_id
     }
 
+    /// Set IRQ callback
     pub fn set_irq_callback(&self, callback: IrqCallback) {
         *self.irq_callback.lock() = Some(callback);
     }
 
-    pub fn can_receive(&self) -> bool {
-        self.state.lock().can_receive()
-    }
-
-    /// Push a character into the RX FIFO (Host -> Guest)
+    /// Push a character into the RxFIFO
     pub fn rx_push(&self, data: u8) -> bool {
         let mut state = self.state.lock();
 
+        // Check if RxFIFO can accept data
         let depth = state.fifo_depth();
-        if state.read_fifo.len() >= depth {
-            trace!("VirtPL011[{}]: RX FIFO full, dropping {:#x}", self.config.uart_id, data);
+        if state.rx_fifo.len() >= depth {
+            warn!("VirtPL011[{}]: RxFIFO full (depth={}), dropping {:#x}",
+                  self.config.uart_id, depth, data);
             return false;
         }
 
-        state.read_fifo.push_back(data as u32);
+        // Push data into RxFIFO
+        state.rx_fifo.push_back(data as u32);
+        trace!("VirtPL011[{}]: rx_push '{}'(0x{:02x}), fifo_len={}, depth={}",
+              self.config.uart_id,
+              if data.is_ascii_graphic() || data == b' ' { data as char } else { '.' },
+              data, state.rx_fifo.len(), depth);
 
         // Update flags
         state.flags.remove(FlagRegister::RXFE);
-        if state.read_fifo.len() >= depth {
+        if state.rx_fifo.len() >= depth {
             state.flags.insert(FlagRegister::RXFF);
         }
 
         // Set RX interrupt if above trigger level
-        if state.read_fifo.len() >= state.read_trigger {
+        if state.rx_fifo.len() >= state.rx_trigger {
             state.int_level.insert(InterruptBits::RX);
         }
-
         drop(state);
+
+        // Update interrupt state
         self.update_interrupt();
+
         true
     }
 
+    /// Update interrupt state and invoke callback if needed
     fn update_interrupt(&self) {
         let state = self.state.lock();
         let masked = state.int_level & state.int_enabled;
@@ -241,8 +249,8 @@ impl VirtPL011 {
     }
 
     /// Handle TX write
-    fn write_tx_data(&self, data: u8) -> bool {
-        let state = self.state.lock();
+    fn write_tx_data(&self, data: u8) {
+        let mut state = self.state.lock();
 
         if !state.cr.contains(ControlRegister::UARTEN) {
             warn!("VirtPL011[{}]: Write to disabled UART", self.config.uart_id);
@@ -251,67 +259,69 @@ impl VirtPL011 {
             warn!("VirtPL011[{}]: Write with TX disabled", self.config.uart_id);
         }
 
-        let loopback = state.cr.contains(ControlRegister::LBE);
-        drop(state);
-
-        // Try to send to peer vUART if connected
-        if let Some(peer) = self.get_peer() {
-            // Push data to peer's RX FIFO
-            let sent = peer.rx_push(data);
-            if !sent {
-                // Peer's RX FIFO is full
-                trace!("VirtPL011[{}]: peer RX full, data dropped: {:#x}", self.config.uart_id, data);
-            }
-
-            if let Some(probe) = &*self.output_probe.lock() {
-                probe(data);
-            }
-            // TX operation completed, set TX interrupt
-            self.state.lock().int_level.insert(InterruptBits::TX);
-            self.update_interrupt();
-
-            return sent;
-        }
-
-        // No peer connected
-        // TX always succeeds immediately, set TX interrupt
-        let mut state = self.state.lock();
-        state.int_level.insert(InterruptBits::TX);
-        drop(state);
-
         // Loopback: push to local RX
+        let loopback = state.cr.contains(ControlRegister::LBE);
         if loopback {
             self.rx_push(data);
         }
 
+        let mut data = Some(data);
+
+        // Try to send to peer vUART if connected
+        if let Some(peer) = self.get_peer() {
+            // Push data to peer's RxFIFO
+            let sent = peer.rx_push(data.unwrap());
+            if !sent {
+                // Peer's RxFIFO is full
+                trace!("VirtPL011[{}]: peer RxFIFO full, data dropped: {:#x}", self.config.uart_id, data.unwrap());
+                data = None;
+            }
+        }
+
+        // Try to output via probe callback
+        if let Some(probe) = &*self.probe_callback.lock() {
+            if let Some(data) = data {
+                probe(data);
+            }
+        }
+
+        // TX operation completed, set TX interrupt
+        state.int_level.insert(InterruptBits::TX);
+        drop(state);
+
         // Update interrupt state
         self.update_interrupt();
-        true
     }
 
     /// Handle RX read
     fn read_rx_data(&self) -> u32 {
         let mut state = self.state.lock();
 
-        if state.read_fifo.is_empty() {
+        if state.rx_fifo.is_empty() {
             return 0;
         }
 
-        let value = state.read_fifo.pop_front().unwrap_or(0);
+        let value = state.rx_fifo.pop_front().unwrap_or(0);
+        let byte = (value & 0xFF) as u8;
+        trace!("VirtPL011[{}]: read_rx_data '{}'(0x{:02x}), remaining={}",
+              self.config.uart_id,
+              if byte.is_ascii_graphic() || byte == b' ' { byte as char } else { '.' },
+              byte, state.rx_fifo.len());
 
         // Update flags
         state.flags.remove(FlagRegister::RXFF);
-        if state.read_fifo.is_empty() {
+        if state.rx_fifo.is_empty() {
             state.flags.insert(FlagRegister::RXFE);
         }
-        if state.read_fifo.len() < state.read_trigger {
+        if state.rx_fifo.len() < state.rx_trigger {
             state.int_level.remove(InterruptBits::RX);
         }
 
         // Update RSR with error flags
         state.rsr = (value >> 8) & 0xF;
-
         drop(state);
+
+        // Update interrupt state
         self.update_interrupt();
 
         value
@@ -406,7 +416,7 @@ impl VirtPL011 {
                 let new_fen = state.lcr.fifo_enabled();
                 // Clear FIFOs on FIFO enable/disable
                 if old_fen != new_fen {
-                    state.read_fifo.clear();
+                    state.rx_fifo.clear();
                     state.flags.insert(FlagRegister::RXFE | FlagRegister::TXFE);
                     state.flags.remove(FlagRegister::RXFF | FlagRegister::TXFF);
                 }
@@ -451,7 +461,55 @@ impl core::fmt::Debug for VirtPL011 {
             .field("base_gpa", &format_args!("{:#x}", self.config.base_gpa))
             .field("irq_id", &self.config.irq_id)
             .field("flags", &state.flags)
-            .field("rx_count", &state.read_fifo.len())
+            .field("rx_count", &state.rx_fifo.len())
             .finish()
     }
 }
+
+static PL011_REGISTRY: Mutex<BTreeMap<usize, Arc<VirtPL011>>> = Mutex::new(BTreeMap::new());
+static PL011_COUNTER: Mutex<usize> = Mutex::new(1);
+
+pub struct PL011Manager;
+
+impl PL011Manager {
+    /// Register a UART device
+    pub fn register(uart_id: usize, uart: Arc<VirtPL011>) {
+        let mut registry = PL011_REGISTRY.lock();
+        registry.insert(uart_id, uart);
+    }
+
+    /// Get the UART device
+    pub fn get(uart_id: usize) -> Option<Arc<VirtPL011>> {
+        let registry = PL011_REGISTRY.lock();
+        registry.get(&uart_id).cloned()
+    }
+    
+    /// Unregister the UART device
+    #[allow(unused)]
+    pub fn unregister(uart_id: usize) {
+        let mut registry = PL011_REGISTRY.lock();
+        registry.remove(&uart_id);
+    }
+
+    /// Connect two VMs' UARTs for communication.
+    #[allow(unused)]
+    pub fn connect(uart_id_a: usize, uart_id_b: usize) {
+        let registry = PL011_REGISTRY.lock();
+        if let (Some(uart_a), Some(uart_b)) = (registry.get(&uart_id_a), registry.get(&uart_id_b)) {
+            // Use Arc::downgrade to create Weak references
+            uart_a.set_peer(Arc::downgrade(uart_b));
+            uart_b.set_peer(Arc::downgrade(uart_a));
+            info!("Connected UARTs of UART {} and UART {}", uart_id_a, uart_id_b);
+        } else {
+            warn!("One or both UARTs not found for {} and {}", uart_id_a, uart_id_b);
+        }
+    }
+
+    pub fn gen_id() -> usize {
+        let mut counter = PL011_COUNTER.lock();
+        let id = *counter;
+        *counter += 1;
+        id
+    }
+}
+  

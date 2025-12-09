@@ -3,8 +3,6 @@ name = "axvuart"
 version = "0.1.0"
 edition = "2024"
 description = "Virtual PL011 UART device implementation for AxVisor hypervisor."
-authors.workspace = true
-license.workspace = true
 
 [features]
 default = []
