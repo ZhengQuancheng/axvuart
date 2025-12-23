@@ -10,7 +10,7 @@ default = []
 [dependencies]
 axaddrspace = "0.1"
 axdevice_base = "0.1"
-axvmconfig = { git = "https://github.com/arceos-hypervisor/axvmconfig.git", branch = "next" }
+axvmconfig = { version = "0.1", default-features = false }
 
 axerrno = "0.1.0"
 bitflags = "2.2"
