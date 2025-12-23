@@ -8,15 +8,12 @@ description = "Virtual PL011 UART device implementation for AxVisor hypervisor."
 default = []
 
 [dependencies]
-# Workspace dependencies
-axaddrspace = { workspace = true }
-axdevice_base = { workspace = true }
-axvmconfig = { workspace = true }
+axaddrspace = "0.1"
+axdevice_base = "0.1"
+axvmconfig = { git = "https://github.com/arceos-hypervisor/axvmconfig.git", branch = "next" }
 
-# External dependencies
 axerrno = "0.1.0"
-bitflags = { workspace = true }
-log = { workspace = true }
+bitflags = "2.2"
+log = "0.4"
 memory_addr = "0.4"
-spin = { workspace = true }
-
+spin = "0.9"
